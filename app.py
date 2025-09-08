@@ -62,15 +62,144 @@ if uploaded_file:
         query = st.text_input("Ask your question in plain English and hit enter:")
 
         if query:
-            q = query.lower()
+            q = query.strip()
+            q_lower = q.lower()
             computed_answer = None
             chart = None
 
-            # ---------- pandas computations ----------
+            # ---------- If query likely a column name or short column-related phrase ----------
+            tokens = [t for t in q_lower.replace("_", " ").split() if t]
+            is_short = len(tokens) <= 3  # short queries likely point to a column
+            matched_col = None
+
+            # try exact column name match (case-insensitive)
+            for col in df.columns:
+                if col.lower() == q_lower:
+                    matched_col = col
+                    break
+
+            # if not exact, try match_column on each token (prioritize longer token)
+            if not matched_col and is_short:
+                # try to find best match among tokens (try combined tokens too)
+                # first try full query without spaces
+                combined = q_lower.replace(" ", "")
+                matched_col = match_column(combined, df.columns)
+                if not matched_col:
+                    # try each token
+                    for t in tokens:
+                        mc = match_column(t, df.columns)
+                        if mc:
+                            matched_col = mc
+                            break
+
+            # If we have a matched column AND query does NOT contain other intent keywords,
+            # show the column value counts table + chart immediately.
+            intent_keywords = ["total", "sum", "average", "mean", "group", "by", "chart", "graph", "bar", "pie", "line", "percentage", "percent", "hist", "count"]
+            if matched_col and not any(k in q_lower for k in intent_keywords):
+                # Prepare value counts table
+                vc = df[matched_col].fillna("<<MISSING>>")
+                vc_counts = vc.value_counts(dropna=False).reset_index()
+                vc_counts.columns = [matched_col, "count"]
+                st.markdown(f"### 📝 Value counts for `{matched_col}`")
+                st.write(vc_counts)
+                download_button(vc_counts, f"{matched_col}_value_counts.csv")
+
+                # Plot bar chart if number of unique values is reasonable
+                if len(vc_counts) <= 100:
+                    try:
+                        chart = px.bar(vc_counts, x=matched_col, y="count", title=f"{matched_col} — value counts")
+                        st.plotly_chart(chart, use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Could not draw chart for {matched_col}: {e}")
+
+                # Do not run further pandas-intent branches; but still optionally show AI explanation
+                if use_ai and API_KEY:
+                    # Build prompt for explanation
+                    prompt = f"""You are a data analyst. The dataframe has {len(df)} rows and {len(df.columns)} columns.
+Columns: {list(df.columns)}
+User asked: {query}
+We displayed the value counts table for column '{matched_col}'. Provide a short insight or observation about this column (max 3 sentences)."""
+                    # Robust Gemini handling - try modern API then fallbacks
+                    explanation = None
+                    try:
+                        import google.generativeai as genai
+                    except Exception as e:
+                        st.error(f"google-generativeai import failed: {e}")
+                    else:
+                        try:
+                            genai.configure(api_key=API_KEY)
+                        except Exception as e:
+                            st.error(f"Failed to configure google.generativeai with provided key: {e}")
+                        else:
+                            mname = model_name.strip() or "gemini-2.5-flash"
+                            explanation_text = None
+                            last_err = None
+
+                            # Try GenerativeModel.generate_content (modern)
+                            try:
+                                if hasattr(genai, "GenerativeModel"):
+                                    model_obj = genai.GenerativeModel(mname)
+                                    try:
+                                        resp = model_obj.generate_content(prompt)
+                                    except TypeError:
+                                        resp = model_obj.generate_content(input=prompt)
+                                    if hasattr(resp, "text"):
+                                        explanation_text = resp.text
+                                    else:
+                                        explanation_text = str(resp)
+                            except Exception as e:
+                                last_err = e
+                                explanation_text = None
+
+                            # Fallback: genai.generate_text
+                            if not explanation_text:
+                                try:
+                                    if hasattr(genai, "generate_text"):
+                                        resp = genai.generate_text(model=mname, prompt=prompt)
+                                        if hasattr(resp, "text"):
+                                            explanation_text = resp.text
+                                        elif hasattr(resp, "candidates") and len(resp.candidates) > 0:
+                                            cand = resp.candidates[0]
+                                            explanation_text = cand.content if hasattr(cand, "content") else str(cand)
+                                        else:
+                                            explanation_text = str(resp)
+                                except Exception as e:
+                                    last_err = e
+                                    explanation_text = None
+
+                            # Fallback: genai.models.generate(...)
+                            if not explanation_text:
+                                try:
+                                    if hasattr(genai, "models") and hasattr(genai.models, "generate"):
+                                        resp = genai.models.generate(model=mname, prompt=prompt)
+                                        if hasattr(resp, "output"):
+                                            explanation_text = str(resp.output)
+                                        else:
+                                            explanation_text = str(resp)
+                                except Exception as e:
+                                    last_err = e
+                                    explanation_text = None
+
+                            if explanation_text:
+                                explanation = explanation_text
+                            else:
+                                st.error("Could not extract text from Google SDK. Last SDK error: " + str(last_err))
+
+                    if explanation:
+                        st.markdown("### 🤖 AI Explanation (Gemini)")
+                        st.write(explanation)
+
+                # STOP further processing (we already answered with a table/chart)
+                continue  # go to next iteration of the UI loop (Streamlit will render)
+
+            # ---------- If not a simple column-name query, proceed to previous logic ----------
+            # existing pandas computations: total, average, group by, chart requests
+
+            # ---------- Attempt direct pandas computations first ---------- #
             try:
                 # TOTAL / SUM
-                if "total" in q or "sum" in q:
-                    words = q.split()
+                if "total" in q_lower or "sum" in q_lower:
+                    words = q_lower.split()
                     target_col = None
                     for w in words:
                         col_match = match_column(w, df.columns)
@@ -79,6 +208,7 @@ if uploaded_file:
                             break
 
                     if target_col:
+                        # coerce to numeric safely
                         total_val = pd.to_numeric(df[target_col], errors="coerce").sum()
                         computed_answer = pd.DataFrame({"Column": [target_col], "Total": [total_val]})
                         st.markdown(f"### 📝 Total of {target_col}")
@@ -93,8 +223,8 @@ if uploaded_file:
                             download_button(computed_answer, "total_results.csv")
 
                 # AVERAGE / MEAN
-                elif "average" in q or "mean" in q:
-                    words = q.split()
+                elif "average" in q_lower or "mean" in q_lower:
+                    words = q_lower.split()
                     target_col = None
                     for w in words:
                         col_match = match_column(w, df.columns)
@@ -117,8 +247,8 @@ if uploaded_file:
                             download_button(computed_answer, "average_results.csv")
 
                 # GROUP BY (improved prioritization)
-                elif "group" in q or " by " in q or "wise" in q:
-                    words = q.replace("wise", "by").split()
+                elif "group" in q_lower or " by " in q_lower or "wise" in q_lower:
+                    words = q_lower.replace("wise", "by").split()
                     group_candidate = None
                     value_candidate = None
 
@@ -154,14 +284,14 @@ if uploaded_file:
                                        title=f"{value_candidate} by {group_candidate}")
 
                 # GRAPH/CHART REQUESTS
-                elif any(k in q for k in ["chart", "graph", "bar", "pie", "line", "hist", "histogram"]):
+                elif any(k in q_lower for k in ["chart", "graph", "bar", "pie", "line", "hist", "histogram"]):
                     numeric_cols = df.select_dtypes(include="number").columns
                     if len(numeric_cols) == 0:
                         st.warning("No numeric columns available for charting.")
                     else:
                         # Detect x and y intelligently
                         x_col = None
-                        for w in q.split():
+                        for w in q_lower.split():
                             m = match_column(w, df.columns)
                             if m and m not in numeric_cols:
                                 x_col = m
@@ -170,7 +300,7 @@ if uploaded_file:
                             x_col = df.columns[0]
 
                         y_col = None
-                        for w in q.split():
+                        for w in q_lower.split():
                             m = match_column(w, df.columns)
                             if m and m in numeric_cols:
                                 y_col = m
@@ -178,11 +308,11 @@ if uploaded_file:
                         if y_col is None:
                             y_col = numeric_cols[0]
 
-                        if "bar" in q:
+                        if "bar" in q_lower:
                             chart = px.bar(df, x=x_col, y=y_col, title=f"Bar: {y_col} by {x_col}")
-                        elif "pie" in q:
+                        elif "pie" in q_lower:
                             chart = px.pie(df, names=x_col, values=y_col, title=f"Pie: {y_col} by {x_col}")
-                        elif "line" in q:
+                        elif "line" in q_lower:
                             chart = px.line(df, x=x_col, y=y_col, title=f"Line: {y_col} by {x_col}")
                         else:
                             chart = px.histogram(df, x=y_col, title=f"Histogram of {y_col}")
@@ -216,61 +346,57 @@ Show a short explanation/insight only. Computed results (if any) are already sho
                         explanation = None
                     else:
                         mname = model_name.strip() or "gemini-2.5-flash"
+                        explanation_text = None
+                        last_err = None
+
                         # 1) Try GenerativeModel.generate_content (modern)
                         try:
                             if hasattr(genai, "GenerativeModel"):
                                 model_obj = genai.GenerativeModel(mname)
-                                # generate_content sometimes expects keyword 'prompt' or 'input' depending on SDK; try both
                                 try:
                                     resp = model_obj.generate_content(prompt)
                                 except TypeError:
-                                    # try input=...
                                     resp = model_obj.generate_content(input=prompt)
-                                # resp may have .text or other structure
                                 if hasattr(resp, "text"):
-                                    explanation = resp.text
+                                    explanation_text = resp.text
                                 else:
-                                    # try to stringify
-                                    explanation = str(resp)
+                                    explanation_text = str(resp)
                         except Exception as e:
                             last_err = e
-                            explanation = None
+                            explanation_text = None
 
-                        # 2) Fallback: genai.generate_text (older SDKs)
-                        if not explanation:
+                        # 2) Fallback: genai.generate_text
+                        if not explanation_text:
                             try:
                                 if hasattr(genai, "generate_text"):
                                     resp = genai.generate_text(model=mname, prompt=prompt)
                                     if hasattr(resp, "text"):
-                                        explanation = resp.text
+                                        explanation_text = resp.text
                                     elif hasattr(resp, "candidates") and len(resp.candidates) > 0:
-                                        # some variants
                                         cand = resp.candidates[0]
-                                        if hasattr(cand, "content"):
-                                            explanation = cand.content
-                                        else:
-                                            explanation = str(cand)
+                                        explanation_text = cand.content if hasattr(cand, "content") else str(cand)
                                     else:
-                                        explanation = str(resp)
+                                        explanation_text = str(resp)
                             except Exception as e:
                                 last_err = e
-                                explanation = None
+                                explanation_text = None
 
                         # 3) Fallback: genai.models.generate(...)
-                        if not explanation:
+                        if not explanation_text:
                             try:
                                 if hasattr(genai, "models") and hasattr(genai.models, "generate"):
                                     resp = genai.models.generate(model=mname, prompt=prompt)
-                                    # resp may contain 'output' or similar
                                     if hasattr(resp, "output"):
-                                        explanation = str(resp.output)
+                                        explanation_text = str(resp.output)
                                     else:
-                                        explanation = str(resp)
+                                        explanation_text = str(resp)
                             except Exception as e:
                                 last_err = e
-                                explanation = None
+                                explanation_text = None
 
-                        if not explanation and last_err:
+                        if explanation_text:
+                            explanation = explanation_text
+                        else:
                             st.error("Could not extract text from Google SDK. Last SDK error: " + str(last_err))
 
                 if explanation:
