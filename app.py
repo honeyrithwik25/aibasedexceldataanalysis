@@ -1,265 +1,212 @@
 # app.py
 import os
 import json
-import io
-import traceback
-from typing import Optional
-
+import re
+import textwrap
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-from dotenv import load_dotenv
+import numpy as np
+import matplotlib.pyplot as plt
 
-# Try to import Gemini client
+# --- Gemini client (google-generativeai) ---
 try:
     import google.generativeai as genai
-except Exception as e:
+except Exception:
     genai = None
 
-# ----------------------
-# Config & Helpers
-# ----------------------
-load_dotenv()  # loads .env if present
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+st.set_page_config(page_title="Excel Deep Analysis (Gemini)", layout="wide")
+st.title("📊 Excel Deep Analysis — Localhost (Gemini)")
 
-st.set_page_config(page_title="Excel Deep Analysis (Local • Gemini)", layout="wide")
-st.title("📊 Excel Deep Analysis — Local (Gemini)")
+st.markdown(
+    "Upload an Excel/CSV (no files are saved). Ask questions in natural language. "
+    "The model will propose safe pandas code which you can review and run locally."
+)
 
-if genai is None:
-    st.error("Missing google.generativeai package. Install with:\n\npip install google-generativeai")
-    st.stop()
-
-if not GEMINI_API_KEY:
-    st.warning("No GEMINI_API_KEY found in environment. Create a .env with GEMINI_API_KEY=your_key or set env var.")
-    st.info("If you already have a key, put it in a .env file or set environment variable and restart the app.")
-    # continue: user may still want to upload but model won't call
-
+# ---- Load API Key from ENV ----
+API_KEY = os.getenv("GENIE_API_KEY")
+if not API_KEY:
+    st.warning(
+        "No Gemini API key found in environment variable `GENIE_API_KEY`. "
+        "Set it before running the app. (See README / instructions.)"
+    )
 else:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-    except Exception as e:
-        st.error(f"Failed to configure Gemini key: {e}")
-        st.stop()
+    if genai is not None:
+        genai.configure(api_key=API_KEY)
 
-# Utility: attempt to parse model response robustly
-def extract_text_from_response(resp) -> str:
-    """
-    Try common places to extract response text from various forms of gemini response object.
-    """
-    try:
-        if hasattr(resp, "text"):
-            return resp.text
-        # older variants
-        if hasattr(resp, "candidates") and len(resp.candidates) > 0:
-            c = resp.candidates[0]
-            if hasattr(c, "content"):
-                return str(c.content)
-            return str(c)
-        return str(resp)
-    except Exception:
-        return str(resp)
+# ---- File upload (in-memory) ----
+uploaded_file = st.file_uploader("Upload Excel or CSV (keeps in memory only)", type=["csv", "xlsx"])
 
-# Render table without index and center-align integers
-def show_dataframe_centered(df: pd.DataFrame):
-    # Round numeric columns to 0 decimals if they are effectively integers
-    df_display = df.copy()
-    for col in df_display.select_dtypes(include="number").columns:
-        # round values that are near-integers
-        df_display[col] = df_display[col].round(0).astype(pd.Int64Dtype())
-    st.dataframe(df_display.style.set_properties(**{"text-align":"center"}), use_container_width=True)
-
-# Parse JSON safely
-def parse_json(text: str) -> Optional[dict]:
+df = None
+if uploaded_file is not None:
     try:
-        return json.loads(text)
-    except Exception:
-        # try to extract JSON substring between first { and last }
-        try:
-            start = text.index("{")
-            end = text.rindex("}") + 1
-            return json.loads(text[start:end])
-        except Exception:
-            return None
-
-# ----------------------
-# UI — File upload
-# ----------------------
-uploaded_file = st.file_uploader("Upload Excel (.xlsx) or CSV (.csv)", type=["csv", "xlsx"])
-sample_df = None
-if uploaded_file:
-    try:
-        if uploaded_file.name.lower().endswith(".csv"):
-            sample_df = pd.read_csv(uploaded_file)
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
         else:
-            sample_df = pd.read_excel(uploaded_file)
+            df = pd.read_excel(uploaded_file)
+        st.success(f"Loaded `{uploaded_file.name}` — shape {df.shape}")
+        st.dataframe(df.head(10), use_container_width=True)
     except Exception as e:
         st.error(f"Failed to read file: {e}")
         st.stop()
 
-    st.success(f"Loaded `{uploaded_file.name}` — {sample_df.shape[0]} rows × {sample_df.shape[1]} cols")
-    st.write("### Preview")
-    st.dataframe(sample_df.head(10), use_container_width=True)
+# ---- User question ----
+question = st.text_input("Ask a question about the data (e.g. 'department wise % increase in 2023-24')")
 
-    # show basic column types & sample values
-    with st.expander("Columns & types"):
-        cols_info = pd.DataFrame({
-            "column": sample_df.columns,
-            "dtype": [str(sample_df[c].dtype) for c in sample_df.columns],
-            "non_null": [int(sample_df[c].notna().sum()) for c in sample_df.columns]
-        })
-        st.dataframe(cols_info, use_container_width=True)
+# Optional: immediate run toggle
+auto_run = st.checkbox("Auto-run generated code without confirmation (risky)", value=False)
 
-# ----------------------
-# UI — Question input
-# ----------------------
-question = st.text_input("Ask a question about your data (e.g., 'Department wise % increased 23-24', 'age bins of 5 years and headcount bar chart')")
+# Helper to build the prompt sent to Gemini
+def build_prompt(df_sample_csv, columns_list, user_question):
+    instructions = textwrap.dedent(f"""
+    You are a professional Python / Pandas data analyst.
+    The dataframe variable is called `df` (pandas DataFrame).
+    I will provide the dataframe columns and a small CSV sample.
 
-run_auto = st.checkbox("Auto-run on typing (runs whenever you type)", value=False)
-analyze_clicked = st.button("Analyze")
+    Requirements (must follow exactly):
+    1) Produce a single JSON object and nothing else. The JSON must have these keys:
+       - "code": a Python code string (no imports) that uses 'df' and assigns the final output
+         into a variable named 'result' (Pandas DataFrame) or into 'result_figure' (matplotlib Figure).
+       - "explanation": a short plain-English explanation of what the code does (<= 40 words).
+    2) The code should NOT write files to disk. It must not use open(), os.system, subprocess, or any imports.
+    3) Round numeric outputs to integers (use .round(0).astype(int) where relevant) so the result shows no decimals.
+    4) If producing a chart, assign a matplotlib Figure to variable 'result_figure'. If producing a table, assign a DataFrame to 'result'.
+    5) Keep computations deterministic and clear (groupby, agg, merge, pd.cut, etc.).
+    6) Use only 'pd' and 'np' and assume they are available.
+    7) Keep code reasonably short (<= 40 lines).
+    8) Do not include any sensitive data in responses.
 
-should_run = False
-if uploaded_file and sample_df is not None:
-    if analyze_clicked:
-        should_run = True
-    elif run_auto and question.strip():
-        should_run = True
+    Now, dataframe columns: {columns_list}
+    CSV sample (top rows):
+    {df_sample_csv}
 
-if not uploaded_file:
-    st.info("Upload a file to enable analysis.")
-    should_run = False
+    User question: {user_question}
 
-# ----------------------
-# Analysis runner
-# ----------------------
-if should_run:
-    with st.spinner("Asking Gemini and analyzing..."):
-        # Build a controlled prompt requesting JSON output
-        col_list = list(sample_df.columns)
-        # small sample to include but limit size
-        head_csv = sample_df.head(10).to_csv(index=False)
+    Output: single JSON object with keys 'code' and 'explanation'.
+    """)
+    return instructions
 
-        prompt = f"""
-You are an expert data analyst. You will be provided:
-1) A list of dataframe columns (name and dtype).
-2) A small CSV sample of the dataframe (first 10 rows).
-3) A user question.
+# Function to call Gemini model
+def call_gemini(prompt_text):
+    if genai is None:
+        raise RuntimeError("google.generativeai package not installed.")
+    model = genai.GenerativeModel("gemini-1.5-flash")  # works in many environments
+    # We send prompt and sample as a single text item
+    resp = model.generate_content(prompt_text)
+    # response.text holds the generated text
+    return resp.text if hasattr(resp, "text") else str(resp)
 
-Your task: answer the question precisely using Pandas/analysis logic. RETURN A SINGLE JSON OBJECT ONLY (no additional commentary).
-The JSON must be valid and strictly follow this schema:
-
-{{
-  "type": "table" | "chart" | "text",            # indicates output type
-  "table_csv": "<CSV string>" | null,            # if type == table, return CSV text (no index)
-  "chart_spec": {{                               
-      "kind":"bar"|"line"|"pie"|"histogram",      # chart type
-      "x":"column_name",
-      "y":"column_name",
-      "aggregate":"sum"|"mean"|"count"|"none"
-  }} | null,
-  "text": "<short textual conclusion, numbers rounded to integers>"  # small textual summary
-}}
-
-Rules:
-- If the user asked for a chart (bar, histogram, etc.), return type="chart" and populate chart_spec (and you may also include table_csv).
-- If a table is requested or natural, return type="table" and put the results as CSV string in table_csv.
-- All numeric values in table_csv should be rounded to integers (no decimals).
-- The "text" field should be 1-2 sentences summarizing the key result (rounded numbers).
-- Use the columns exactly as provided. Do NOT invent new columns.
-- If you cannot compute because of missing columns, return type="text" with an explanation in "text".
-- USER QUESTION: {question}
-
-COLUMNS: {json.dumps([{ "name": c, "dtype": str(sample_df[c].dtype) } for c in col_list])}
-SAMPLE_CSV:
-{head_csv}
-"""
-
+# Parse a JSON blob inside model output (best-effort)
+def extract_json_from_text(text):
+    # Find first JSON object in text
+    match = re.search(r'(\{[\s\S]*\})', text)
+    if not match:
+        return None
+    json_text = match.group(1)
+    try:
+        return json.loads(json_text)
+    except Exception:
+        # Try to clean trailing commas etc.
+        cleaned = re.sub(r',\s*}', '}', json_text)
+        cleaned = re.sub(r',\s*\]', ']', cleaned)
         try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content([prompt])
-            resp_text = extract_text_from_response(response)
-        except Exception as e:
-            st.error("Error calling Gemini API:")
-            st.text(traceback.format_exc())
-            resp_text = None
+            return json.loads(cleaned)
+        except Exception:
+            return None
 
-        if not resp_text:
-            st.error("No response from model.")
-        else:
-            # Try parse JSON
-            parsed = parse_json(resp_text)
-            if parsed is None:
-                st.warning("Model did not return strict JSON. Showing raw text output. You can try rephrasing the question.")
-                st.subheader("Raw model output")
-                st.text(resp_text)
+# Safe execution environment (limited builtins)
+SAFE_BUILTINS = {"len": len, "min": min, "max": max, "sum": sum, "round": round, "range": range, "abs": abs}
+def safe_exec(code_str, df):
+    """Execute code_str in a restricted environment. Returns locals dict after exec."""
+    g = {"pd": pd, "np": np, "plt": plt, "__builtins__": SAFE_BUILTINS}
+    l = {"df": df.copy()}  # work on a copy to avoid accidental modifications
+    exec(compile(code_str, "<string>", "exec"), g, l)
+    return l
+
+# ---- Analysis flow ----
+if st.button("Analyze") or (auto_run and question.strip() and df is not None):
+    if df is None:
+        st.error("Upload a file first.")
+    elif not API_KEY:
+        st.error("Set GENIE_API_KEY environment variable before running the app.")
+    else:
+        # build prompt from first 8 rows CSV (keeps data small)
+        sample_csv = df.head(8).to_csv(index=False)
+        cols = list(df.columns)
+        prompt = build_prompt(sample_csv, cols, question)
+        with st.spinner("Sending question to Gemini — generating pandas code..."):
+            try:
+                raw = call_gemini(prompt)
+            except Exception as e:
+                st.error(f"Gemini call failed: {e}")
+                raw = None
+
+        if raw:
+            st.subheader("Model output (raw)")
+            st.code(raw)
+
+            parsed = extract_json_from_text(raw)
+            if not parsed or "code" not in parsed:
+                st.error("Could not extract JSON with 'code' from the model output. Try rephrasing the question.")
             else:
-                # Process structured output
-                out_type = parsed.get("type", "text")
-                st.subheader("Model conclusion")
-                st.write(parsed.get("text", ""))
+                code = parsed["code"]
+                explanation = parsed.get("explanation", "")
+                st.subheader("Generated Python code (review before running)")
+                st.code(code, language="python")
+                st.markdown(f"**Explanation:** {explanation}")
 
-                if out_type == "table" and parsed.get("table_csv"):
+                # Run automatically if auto_run True, otherwise require confirmation
+                run_now = auto_run or st.button("Run generated code now")
+                if run_now:
                     try:
-                        table_csv = parsed["table_csv"]
-                        df_out = pd.read_csv(io.StringIO(table_csv))
-                        st.subheader("Result Table")
-                        show_dataframe_centered(df_out)
-                    except Exception as e:
-                        st.error("Failed to parse table CSV from model output.")
-                        st.text(str(e))
-
-                if out_type == "chart" and parsed.get("chart_spec"):
-                    spec = parsed["chart_spec"]
-                    kind = spec.get("kind")
-                    x = spec.get("x")
-                    y = spec.get("y")
-                    agg = spec.get("aggregate", "none")
-
-                    if x not in sample_df.columns:
-                        st.error(f"Column {x} missing from dataset.")
-                    else:
-                        # prepare data for plot
-                        plot_df = sample_df.copy()
-                        if y and y in plot_df.columns and agg != "none":
-                            if agg == "sum":
-                                grouped = plot_df.groupby(x)[y].sum().reset_index()
-                            elif agg == "mean":
-                                grouped = plot_df.groupby(x)[y].mean().reset_index()
-                            elif agg == "count":
-                                grouped = plot_df.groupby(x)[y].count().reset_index()
-                            else:
-                                grouped = plot_df[[x, y]].copy()
-                            df_plot = grouped
-                            # round numerical values
-                            for col in df_plot.select_dtypes(include="number").columns:
-                                df_plot[col] = df_plot[col].round(0)
+                        locals_after = safe_exec(code, df)
+                        # Check for DataFrame result
+                        if "result" in locals_after and isinstance(locals_after["result"], pd.DataFrame):
+                            res_df = locals_after["result"]
+                            # round numeric columns and convert to int where applicable
+                            num_cols = res_df.select_dtypes(include=[np.number]).columns
+                            try:
+                                res_df[num_cols] = res_df[num_cols].round(0).astype("Int64")
+                            except Exception:
+                                res_df[num_cols] = res_df[num_cols].round(0)
+                            st.subheader("Result — Table")
+                            st.dataframe(res_df, use_container_width=True)
+                        elif "result_figure" in locals_after:
+                            fig = locals_after["result_figure"]
+                            st.subheader("Result — Chart")
+                            st.pyplot(fig)
                         else:
-                            df_plot = plot_df
+                            # fallback: look for any variables that look like result
+                            found = False
+                            for k, v in locals_after.items():
+                                if isinstance(v, pd.DataFrame):
+                                    st.subheader(f"Result — Table ({k})")
+                                    st.dataframe(v, use_container_width=True)
+                                    found = True
+                                    break
+                                if hasattr(v, "savefig") or "Figure" in str(type(v)):
+                                    st.subheader(f"Result — Chart ({k})")
+                                    st.pyplot(v)
+                                    found = True
+                                    break
+                            if not found:
+                                st.info("Executed code but no 'result' DataFrame or 'result_figure' found. Check the generated code output above.")
+                    except Exception as e:
+                        st.error(f"Error while executing generated code: {e}")
 
-                        st.subheader("Result Chart")
-                        try:
-                            if kind == "bar":
-                                fig = px.bar(df_plot, x=x, y=y)
-                            elif kind == "line":
-                                fig = px.line(df_plot, x=x, y=y)
-                            elif kind == "pie":
-                                # pie requires names and values
-                                fig = px.pie(df_plot, names=x, values=y)
-                            elif kind == "histogram":
-                                fig = px.histogram(df_plot, x=x)
-                            else:
-                                st.info("Unknown chart kind. Showing a table instead.")
-                                show_dataframe_centered(df_plot.head(50))
-                                fig = None
-                            if fig:
-                                st.plotly_chart(fig, use_container_width=True)
-                        except Exception as e:
-                            st.error("Failed to generate chart from spec.")
-                            st.text(str(e))
+# ---- Example prompts helper ----
+with st.expander("Examples of useful questions"):
+    st.markdown(
+        """
+        - Department wise % increase in salary for FY24 vs FY23  
+        - Show age bins (20-25, 26-30...) and headcount bar chart  
+        - Average CTC by designation and department (rounded no decimals)  
+        - Cross-tab: Designation vs Rating (counts)  
+        - Show top 10 employees by EP_HRS and their department  
+        """
+    )
 
-                if out_type == "text" and parsed.get("text"):
-                    st.info(parsed["text"])
-
-    # cleanup: ensure no file saved to disk (we never wrote one)
-    st.write("")  # place holder
-
-# End of app.py
+# ---- Footnotes & privacy ----
+st.caption(
+    "Privacy: Uploaded files are processed in memory only and not saved to disk by default. "
+    "However, the content you send to Gemini will go to Google servers per their terms — avoid uploading sensitive personal data if you cannot share it."
+)
